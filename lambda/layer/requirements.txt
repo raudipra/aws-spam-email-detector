@@ -1,0 +1,17 @@
+sagemaker
+google-pasta
+importlib-metadata
+packaging
+pathos
+protobuf
+protobuf3
+smdebug-rulesconfig
+typing-extensions
+zipp
+six
+dill
+attrs==20.3.0
+multiprocess
+pox
+ppft
+pyparsing
