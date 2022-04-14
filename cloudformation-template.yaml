@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation for Spam Email Detector.
+Parameters:
+  SagemakerEndpoint:
+    Type: String
+    Description: Sagemaker Endpoint name
+  LambdaBucket:
+    Type: String
+    Description: S3 Bucket name for lambda function zip
+  LambdaBucketKey:
+    Type: String
+    Description: S3 object key for lambda function zip
+Resources:
+  EmailBucket:
+    Type: 'AWS::S3::Bucket'
+
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    DependsOn: EmailBucket
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonSESFullAccess
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: LambdaBasicExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketNotification'
+                  - 's3:PutBucketNotification'
+                Resource: !Sub 'arn:aws:s3:::${EmailBucket}'
+              - Effect: "Allow"
+                Action: "logs:CreateLogGroup"
+                Resource: !Join
+                  - ''
+                  - - "arn:aws:logs:"
+                    - !Ref "AWS::Region"
+                    - ':'
+                    - !Ref 'AWS::AccountId'
+                    - ':*'
+              - Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Join
+                  - ''
+                  - - 'arn:aws:logs:'
+                    - !Ref "AWS::Region"
+                    - ':'
+                    - !Ref 'AWS::AccountId'
+                    - ':log-group:*'
+        - PolicyName: SageMakerInvokePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "sagemaker:InvokeEndpoint"
+                Resource: "*"
+
+  EmailBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    DependsOn: LambdaRole
+    Properties:
+      Bucket: !Ref EmailBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 's3:PutObject'
+            Effect: Allow
+            Resource: !Sub 'arn:aws:s3:::${EmailBucket}/*'
+            Principal:
+              Service: 
+                - 'ses.amazonaws.com'
+          - Action:
+              - 's3:GetObject'
+            Effect: Allow
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref EmailBucket
+                - /*
+            Principal:
+              AWS: !GetAtt LambdaRole.Arn
+
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: LambdaRole
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Code:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: !Ref LambdaBucketKey
+      Environment:
+        Variables:
+          ENDPOINT_NAME: !Ref SagemakerEndpoint
+      Layers:
+        - arn:aws:lambda:us-east-1:024905340351:layer:sagemaker:6
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p39-pandas:2
+      Timeout: 60
+      Role: !GetAtt LambdaRole.Arn 
+    
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn: LambdaFunction
+    Properties:
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${EmailBucket}'
+
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: LambdaRole
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+
+            from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+            
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+            
+            print('Loading function')
+            s3 = boto3.resource('s3')
+            
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        print("Request Type:",event['RequestType'])
+                        LambdaArn=event['ResourceProperties']['LambdaArn']
+                        Bucket=event['ResourceProperties']['Bucket']
+                        add_notification(LambdaArn, Bucket)
+                        responseData={'Bucket':Bucket}
+                        print("Sending response to custom resource")
+                    responseStatus = 'SUCCESS'
+                except Exception as e:
+                    print('Failed to process:', e)
+                    responseStatus = 'FAILED'
+                    responseData = {'Failure': 'Something bad happened.'}
+                cfnresponse.send(event, context, responseStatus, responseData)
+
+            def add_notification(LambdaArn, Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                  NotificationConfiguration={
+                    'LambdaFunctionConfigurations': [
+                      {
+                          'LambdaFunctionArn': LambdaArn,
+                          'Events': [
+                              's3:ObjectCreated:*'
+                          ]
+                      }
+                    ]
+                  }
+                )
+                print("Put request completed....")
+              
+            def delete_notification(Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration={}
+                )
+                print("Delete request completed....")
+      Runtime: python3.6
+      Timeout: 50
+
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt LambdaFunction.Arn
+      Bucket: !Ref EmailBucket
+
+  SESReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+
+  SESReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: EmailBucketPolicy
+    Properties: 
+      Rule: 
+        Actions: 
+          - S3Action:
+              BucketName: !Ref EmailBucket
+        Enabled: True
+        ScanEnabled: True
+        TlsPolicy: 'Optional'
+      RuleSetName: !Ref SESReceiptRuleSet
